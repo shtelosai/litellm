@@ -1,7 +1,11 @@
 """
 Regression: in-stream error events (type="error", type="response.failed") must
-raise litellm.APIError so callers see an exception rather than a benign chunk.
-Previously they were returned as-is, silently bypassing router cooldown logic.
+raise an exception so callers see it rather than a benign chunk. Retriable
+failures (5xx, 429) are wrapped in MidStreamFallbackError so the router's
+FallbackResponsesStreamWrapper can drive the fallback chain (parity with the
+chat-completions streaming path); non-retriable client errors (4xx except 429)
+surface as litellm.APIError directly. Previously they were returned as-is,
+silently bypassing router cooldown logic.
 
 Also covers: ErrorEventError.param must accept dict payloads without raising a
 Pydantic ValidationError (previously typed as Optional[str]).
@@ -17,6 +21,7 @@ import pytest
 sys.path.insert(0, os.path.abspath("../.."))
 
 import litellm
+from litellm.exceptions import MidStreamFallbackError
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
 from litellm.responses.streaming_iterator import (
@@ -48,8 +53,22 @@ def _make_iterator() -> BaseResponsesAPIStreamingIterator:
 
 
 def _make_error_chunk(code: str, message: str = "err") -> ErrorEvent:
+    if code.startswith("rate_limit"):
+        error_type = "rate_limit_error"
+    elif code == "insufficient_quota":
+        error_type = "insufficient_quota"
+    elif code in (
+        "invalid_request_error",
+        "context_length_exceeded",
+        "content_policy_violation",
+        "model_not_found",
+        "invalid_prompt",
+    ):
+        error_type = "invalid_request_error"
+    else:
+        error_type = "server_error"
     error_obj = ErrorEventError(
-        type="rate_limit_error" if code.startswith("rate_limit") else "invalid_request_error",
+        type=error_type,
         code=code,
         message=message,
     )
@@ -59,7 +78,7 @@ def _make_error_chunk(code: str, message: str = "err") -> ErrorEvent:
 def test_maybe_raise_for_error_event_raises_on_error_type():
     iterator = _make_iterator()
     chunk = _make_error_chunk("internal_error", "something went wrong")
-    with pytest.raises(litellm.APIError) as exc_info:
+    with pytest.raises(MidStreamFallbackError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 500
 
@@ -67,14 +86,29 @@ def test_maybe_raise_for_error_event_raises_on_error_type():
 def test_maybe_raise_for_error_event_maps_rate_limit_to_429():
     iterator = _make_iterator()
     chunk = _make_error_chunk("rate_limit_exceeded", "Too many requests")
-    with pytest.raises(litellm.APIError) as exc_info:
+    with pytest.raises(MidStreamFallbackError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 429
+    assert isinstance(exc_info.value.original_exception, litellm.APIError)
 
 
 def test_maybe_raise_for_error_event_maps_invalid_request_to_400():
     iterator = _make_iterator()
     chunk = _make_error_chunk("invalid_request_error", "bad request")
+    with pytest.raises(litellm.APIError) as exc_info:
+        iterator._maybe_raise_for_error_event(chunk)
+    assert exc_info.value.status_code == 400
+
+
+def test_maybe_raise_for_error_event_maps_invalid_request_type_with_prompt_code_to_400():
+    """Real OpenAI shape: type='invalid_request_error' with code='invalid_prompt' must map to 400."""
+    iterator = _make_iterator()
+    error_obj = ErrorEventError(
+        type="invalid_request_error",
+        code="invalid_prompt",
+        message="bad prompt",
+    )
+    chunk = ErrorEvent(type=ResponsesAPIStreamEvents.ERROR, sequence_number=0, error=error_obj)
     with pytest.raises(litellm.APIError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 400
@@ -92,7 +126,7 @@ def test_maybe_raise_for_error_event_maps_insufficient_quota_to_429():
     """OpenAI returns HTTP 429 for insufficient_quota; it must not map to 400."""
     iterator = _make_iterator()
     chunk = _make_error_chunk("insufficient_quota", "You exceeded your current quota")
-    with pytest.raises(litellm.APIError) as exc_info:
+    with pytest.raises(MidStreamFallbackError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 429
 
@@ -152,7 +186,7 @@ async def test_async_iterator_raises_api_error_on_error_event():
         custom_llm_provider="openai",
     )
 
-    with pytest.raises(litellm.APIError) as exc_info:
+    with pytest.raises(MidStreamFallbackError) as exc_info:
         async for _ in iterator:
             pass
     assert exc_info.value.status_code == 429
@@ -166,7 +200,7 @@ def test_maybe_raise_for_response_failed_event_with_dict_error():
     chunk = Mock()
     chunk.type = "response.failed"
     chunk.response = mock_response_obj
-    with pytest.raises(litellm.APIError) as exc_info:
+    with pytest.raises(MidStreamFallbackError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 429
 
@@ -177,7 +211,7 @@ def test_maybe_raise_for_error_event_null_error_obj():
     chunk = Mock()
     chunk.type = "error"
     chunk.error = None
-    with pytest.raises(litellm.APIError) as exc_info:
+    with pytest.raises(MidStreamFallbackError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 500
     assert "Response API in-stream error" in str(exc_info.value)
@@ -279,7 +313,7 @@ def test_sync_iterator_raises_api_error_on_error_event():
         custom_llm_provider="openai",
     )
 
-    with pytest.raises(litellm.APIError) as exc_info:
+    with pytest.raises(MidStreamFallbackError) as exc_info:
         for _ in iterator:
             pass
     assert exc_info.value.status_code == 429

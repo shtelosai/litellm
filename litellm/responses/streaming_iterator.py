@@ -47,36 +47,43 @@ def _log_background_task_failure(task: "asyncio.Task[Any]", *, task_name: str) -
         verbose_logger.error("%s failed: %s", task_name, exception)
 
 
+_CLIENT_ERROR_TYPES: frozenset[str] = frozenset(("invalid_request_error",))
 _CLIENT_ERROR_CODES: frozenset[str] = frozenset(
     (
-        "invalid_request_error",
         "context_length_exceeded",
         "content_policy_violation",
         "model_not_found",
+        "invalid_prompt",
     )
 )
 
 
-def _error_event_fields(error_obj: object) -> tuple[str, Optional[str]]:
+def _error_event_fields(error_obj: object) -> tuple[str, Optional[str], Optional[str]]:
     if isinstance(error_obj, dict):
         raw_message = error_obj.get("message")
+        raw_type = error_obj.get("type")
         raw_code = error_obj.get("code")
     elif error_obj is not None:
         raw_message = getattr(error_obj, "message", None)
+        raw_type = getattr(error_obj, "type", None)
         raw_code = getattr(error_obj, "code", None)
     else:
         raw_message = None
+        raw_type = None
         raw_code = None
     message = str(raw_message) if raw_message is not None else "Response API in-stream error"
+    error_type = raw_type if isinstance(raw_type, str) else None
     code = raw_code if isinstance(raw_code, str) else None
-    return message, code
+    return message, error_type, code
 
 
-def _status_code_for_error_code(error_code: Optional[str]) -> int:
-    if error_code is None:
-        return 500
-    if error_code.startswith("rate_limit") or error_code == "insufficient_quota":
+def _status_code_for_error(error_type: Optional[str], error_code: Optional[str]) -> int:
+    if error_type is not None and error_type.startswith("rate_limit"):
         return 429
+    if error_code is not None and (error_code.startswith("rate_limit") or error_code == "insufficient_quota"):
+        return 429
+    if error_type in _CLIENT_ERROR_TYPES:
+        return 400
     if error_code in _CLIENT_ERROR_CODES:
         return 400
     return 500
@@ -362,10 +369,10 @@ class BaseResponsesAPIStreamingIterator:
         """
         response_obj = getattr(self.completed_response, "response", None) if self.completed_response else None
         error_info = getattr(response_obj, "error", None) if response_obj else None
-        error_message, error_code = _error_event_fields(error_info)
+        error_message, error_type, error_code = _error_event_fields(error_info)
         self._record_failed_response_usage(response_obj)
         exception = litellm.APIError(
-            status_code=_status_code_for_error_code(error_code),
+            status_code=_status_code_for_error(error_type, error_code),
             message=error_message,
             llm_provider=self.custom_llm_provider or "",
             model=self.model or "",
@@ -393,6 +400,8 @@ class BaseResponsesAPIStreamingIterator:
         )
 
     def _maybe_raise_for_error_event(self, result: object) -> None:
+        from litellm.exceptions import MidStreamFallbackError
+
         chunk_type = getattr(result, "type", None)
         if chunk_type not in ("error", "response.failed"):
             return
@@ -403,12 +412,21 @@ class BaseResponsesAPIStreamingIterator:
             else getattr(result, "error", None)
         )
 
-        error_message, error_code = _error_event_fields(error_obj)
-        raise litellm.APIError(
-            status_code=_status_code_for_error_code(error_code),
+        error_message, error_type, error_code = _error_event_fields(error_obj)
+        status_code = _status_code_for_error(error_type, error_code)
+        api_error = litellm.APIError(
+            status_code=status_code,
             message=error_message,
             llm_provider=self.custom_llm_provider or "",
             model=self.model or "",
+        )
+        if 400 <= status_code < 500 and status_code != 429:
+            raise api_error
+        raise MidStreamFallbackError(
+            message=str(api_error),
+            model=self.model or "",
+            llm_provider=self.custom_llm_provider or "",
+            original_exception=api_error,
         )
 
     def _get_completed_response_object(self) -> Optional[Any]:

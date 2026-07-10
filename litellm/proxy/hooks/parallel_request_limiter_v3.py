@@ -244,6 +244,14 @@ TPM_RESERVED_SCOPES_KEY = "_litellm_tpm_reserved_scopes"
 # does not double-refund.
 TPM_RESERVATION_RELEASED_KEY = "_litellm_tpm_reservation_released"
 RATE_LIMIT_DESCRIPTORS_KEY = "_litellm_rate_limit_descriptors"
+# Stash for the pre-call RateLimitResponse so the streaming success-logging
+# path can mirror ``x-ratelimit-*`` remaining/limit headers into
+# ``standard_logging_object.hidden_params.additional_headers``. Streaming
+# requests return from common_request_processing before
+# ``async_post_call_success_hook`` runs, so the response-object header write
+# never fires and Prometheus / logging callbacks that read the remaining
+# values from the SLP see nothing. See LIT-4333.
+RATE_LIMIT_RESPONSE_KEY = "_litellm_proxy_rate_limit_response"
 # Stash keys live ONLY in metadata channels — never at the top level of the
 # request body. Top-level keys are forwarded as body params to upstream
 # providers, which reject unknown fields with 400/429 errors.
@@ -253,6 +261,7 @@ _LITELLM_STASH_KEYS: Tuple[str, ...] = (
     TPM_RESERVED_SCOPES_KEY,
     TPM_RESERVATION_RELEASED_KEY,
     RATE_LIMIT_DESCRIPTORS_KEY,
+    RATE_LIMIT_RESPONSE_KEY,
 )
 
 
@@ -2037,6 +2046,17 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             else:
                 # add descriptors to request headers
                 data["litellm_proxy_rate_limit_response"] = response
+                # Streaming success logging never sees ``data`` — it reads
+                # ``kwargs["litellm_params"]["metadata"]``. Stash a
+                # reference to the same RateLimitResponse dict there so
+                # async_log_success_event can mirror its ``x-ratelimit-*``
+                # values into ``standard_logging_object`` for
+                # Prometheus / logging callbacks. LIT-4333.
+                self._stash_value_in_metadata_channels(
+                    data=data,
+                    key=RATE_LIMIT_RESPONSE_KEY,
+                    value=response,
+                )
 
             # ----------------------------------------------------------------
             # TPM token reservation
@@ -2133,6 +2153,16 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                         stored_response.setdefault("statuses", []).extend(tpm_response["statuses"])
                     elif tpm_response["statuses"]:
                         data["litellm_proxy_rate_limit_response"] = tpm_response
+                        # Keep the metadata-channel stash pointing at the
+                        # authoritative response — the RPM/max-parallel pass
+                        # produced nothing to stash above, so this is the
+                        # first (and only) snapshot the streaming
+                        # success-logging path can mirror. LIT-4333.
+                        self._stash_value_in_metadata_channels(
+                            data=data,
+                            key=RATE_LIMIT_RESPONSE_KEY,
+                            value=tpm_response,
+                        )
 
                     verbose_proxy_logger.debug(f"TPM tokens reserved: {estimated_tokens} for model {requested_model}")
 
@@ -2317,6 +2347,26 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         ]:
             return "total"  # default to total
         return specified_rate_limit_type
+
+    @staticmethod
+    def _merge_ratelimit_statuses_into_additional_headers(
+        additional_headers: Dict[str, Any],
+        statuses: List[RateLimitStatus],
+    ) -> Dict[str, Any]:
+        """
+        Merge v3 rate-limit statuses into an ``additional_headers`` dict in the
+        ``x-ratelimit-{descriptor_key}-{remaining|limit}-{rate_limit_type}``
+        shape both the response-header path and Prometheus/logging callbacks
+        read. Returns a new dict rather than mutating the input so callers
+        stay explicit about which slot (SLP hidden_params vs response
+        _hidden_params) receives the merged headers.
+        """
+        merged: Dict[str, Any] = dict(additional_headers)
+        for status in statuses:
+            prefix = f"x-ratelimit-{status['descriptor_key']}"
+            merged[f"{prefix}-remaining-{status['rate_limit_type']}"] = status["limit_remaining"]
+            merged[f"{prefix}-limit-{status['rate_limit_type']}"] = status["current_limit"]
+        return merged
 
     @staticmethod
     def _stash_value_in_metadata_channels(
@@ -2698,6 +2748,129 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         except Exception as e:
             verbose_proxy_logger.exception(f"Error in rate limit success event: {str(e)}")
 
+    async def async_logging_hook(
+        self,
+        kwargs: dict,
+        result: Any,
+        call_type: str,
+    ) -> Tuple[dict, Any]:
+        """
+        LIT-4333: for streaming, ``async_post_call_success_hook`` never runs,
+        so the response object's ``_hidden_params.additional_headers`` and
+        the SLP's ``hidden_params.additional_headers`` never receive the v3
+        ``x-ratelimit-{descriptor_key}-{remaining|limit}-{rate_limit_type}``
+        entries. Prometheus / logging callbacks that read those from the
+        standard logging payload then see nothing.
+
+        The hook fires unconditionally in a distinct earlier loop inside
+        ``async_success_handler`` (all callbacks' ``async_logging_hook``
+        complete before any ``async_log_success_event`` starts), so
+        mirroring the pre-call snapshot here guarantees every downstream
+        success callback sees the values regardless of registration order.
+        For non-streaming the write is idempotent: the SLP already carries
+        the values from ``async_post_call_success_hook`` and this hook
+        re-applies the same key/value pairs on top.
+        """
+        self._mirror_ratelimit_response_into_logging_payload(
+            kwargs=kwargs,
+            response_obj=result,
+        )
+        return kwargs, result
+
+    def _mirror_ratelimit_response_into_logging_payload(
+        self,
+        kwargs: Any,
+        response_obj: Any,
+    ) -> None:
+        """
+        Copy the pre-call ``litellm_proxy_rate_limit_response`` snapshot into
+        both ``standard_logging_object.hidden_params.additional_headers``
+        (what Prometheus / logging callbacks read) and, when the response
+        object exposes a ``_hidden_params`` dict, its ``additional_headers``
+        slot (what late readers of the response object see). The snapshot
+        is stashed at pre-call under ``RATE_LIMIT_RESPONSE_KEY`` in the
+        metadata channels the callback ``kwargs`` inherits.
+        """
+        if not isinstance(kwargs, dict):
+            return
+
+        standard_logging_object = kwargs.get("standard_logging_object")
+        standard_logging_metadata: Optional[Dict[str, Any]] = None
+        if isinstance(standard_logging_object, dict):
+            slp_metadata = standard_logging_object.get("metadata")
+            if isinstance(slp_metadata, dict):
+                standard_logging_metadata = slp_metadata
+
+        statuses = self._narrow_ratelimit_statuses(
+            self._lookup_stashed_value(
+                kwargs=kwargs,
+                standard_logging_metadata=standard_logging_metadata,
+                key=RATE_LIMIT_RESPONSE_KEY,
+            )
+        )
+        if not statuses:
+            return
+
+        if isinstance(standard_logging_object, dict):
+            hidden_params = standard_logging_object.get("hidden_params")
+            if not isinstance(hidden_params, dict):
+                hidden_params = {}
+            existing = hidden_params.get("additional_headers")
+            hidden_params["additional_headers"] = self._merge_ratelimit_statuses_into_additional_headers(
+                additional_headers=existing if isinstance(existing, dict) else {},
+                statuses=statuses,
+            )
+            standard_logging_object["hidden_params"] = hidden_params
+
+        response_hidden = getattr(response_obj, "_hidden_params", None)
+        if isinstance(response_hidden, dict):
+            existing = response_hidden.get("additional_headers")
+            response_hidden["additional_headers"] = self._merge_ratelimit_statuses_into_additional_headers(
+                additional_headers=existing if isinstance(existing, dict) else {},
+                statuses=statuses,
+            )
+
+    @staticmethod
+    def _narrow_ratelimit_statuses(stashed: Any) -> List[RateLimitStatus]:
+        """
+        Narrow a stashed RateLimitResponse-shaped dict down to its typed
+        ``statuses`` list. Every RateLimitStatus key the header write reads
+        (``descriptor_key``, ``rate_limit_type``, ``current_limit``,
+        ``limit_remaining``) must be present with the right primitive type;
+        otherwise the entry is dropped. Returns an empty list when the input
+        isn't the expected shape at all — the caller treats empty as
+        "nothing to mirror".
+        """
+        if not isinstance(stashed, dict):
+            return []
+        raw_statuses = stashed.get("statuses")
+        if not isinstance(raw_statuses, list):
+            return []
+        narrowed: List[RateLimitStatus] = []
+        for entry in raw_statuses:
+            if not isinstance(entry, dict):
+                continue
+            descriptor_key = entry.get("descriptor_key")
+            rate_limit_type = entry.get("rate_limit_type")
+            current_limit = entry.get("current_limit")
+            limit_remaining = entry.get("limit_remaining")
+            if (
+                isinstance(descriptor_key, str)
+                and rate_limit_type in ("requests", "tokens", "max_parallel_requests")
+                and isinstance(current_limit, int)
+                and isinstance(limit_remaining, int)
+            ):
+                narrowed.append(
+                    RateLimitStatus(
+                        code=entry.get("code", "OK") if isinstance(entry.get("code"), str) else "OK",
+                        current_limit=current_limit,
+                        limit_remaining=limit_remaining,
+                        rate_limit_type=rate_limit_type,
+                        descriptor_key=descriptor_key,
+                    )
+                )
+        return narrowed
+
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
         """
         On failure: decrement max_parallel_requests and refund the upfront
@@ -2838,15 +3011,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                     if isinstance(_hidden_params, BaseModel):
                         _hidden_params = _hidden_params.model_dump()
 
-                    _additional_headers = _hidden_params.get("additional_headers", {}) or {}
-
-                    # Add rate limit headers
-                    for status in litellm_proxy_rate_limit_response["statuses"]:
-                        prefix = f"x-ratelimit-{status['descriptor_key']}"
-                        _additional_headers[f"{prefix}-remaining-{status['rate_limit_type']}"] = status[
-                            "limit_remaining"
-                        ]
-                        _additional_headers[f"{prefix}-limit-{status['rate_limit_type']}"] = status["current_limit"]
+                    _additional_headers = self._merge_ratelimit_statuses_into_additional_headers(
+                        additional_headers=_hidden_params.get("additional_headers", {}) or {},
+                        statuses=litellm_proxy_rate_limit_response["statuses"],
+                    )
 
                     setattr(
                         response,

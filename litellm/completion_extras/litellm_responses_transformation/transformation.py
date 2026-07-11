@@ -1074,6 +1074,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
 class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
     def __init__(self, streaming_response, sync_stream: bool, json_mode: Optional[bool] = False):
         super().__init__(streaming_response, sync_stream, json_mode)
+        self._reasoning_items: List[Dict[str, Any]] = []
 
     def _handle_string_chunk(
         self, str_line: Union[str, "BaseModel"]
@@ -1128,6 +1129,18 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         event_type = parsed_chunk.get("type")
         if isinstance(event_type, ResponsesAPIStreamEvents):
             event_type = event_type.value
+
+        if event_type in ("error", "response.failed"):
+            error_payload = parsed_chunk.get("error")
+            if not isinstance(error_payload, dict):
+                response_payload = parsed_chunk.get("response")
+                if isinstance(response_payload, dict):
+                    error_payload = response_payload.get("error")
+            if not isinstance(error_payload, dict):
+                error_payload = parsed_chunk
+            error_code = error_payload.get("code") or error_payload.get("type") or event_type
+            error_message = error_payload.get("message") or "Unknown upstream error"
+            raise ValueError(f"Responses API stream error ({error_code}): {error_message}")
 
         if parsed_chunk.get("object") == "chat.completion.chunk" or (
             event_type is None and isinstance(parsed_chunk.get("choices"), list) and parsed_chunk.get("choices")
@@ -1381,4 +1394,24 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
             ModelResponseStream: OpenAI-formatted streaming chunk
         """
         verbose_logger.debug(f"Chat provider: transform_streaming_response called with chunk: {chunk}")
-        return OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(chunk)
+        event_type = getattr(chunk.get("type"), "value", chunk.get("type"))
+        if event_type == "response.output_item.done":
+            item = chunk.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                self._reasoning_items.append(
+                    _build_reasoning_item(
+                        item_id=item.get("id", ""),
+                        encrypted_content=item.get("encrypted_content"),
+                        summary_raw=item.get("summary"),
+                    )
+                )
+
+        parsed = OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(chunk)
+        if self._reasoning_items and parsed.choices and parsed.choices[0].finish_reason is not None:
+            delta = parsed.choices[0].delta
+            existing = getattr(delta, "reasoning_items", None) or []
+            existing_ids = {item.get("id") for item in existing if isinstance(item, dict)}
+            delta.reasoning_items = list(existing) + [
+                item for item in self._reasoning_items if item.get("id") not in existing_ids
+            ]
+        return parsed

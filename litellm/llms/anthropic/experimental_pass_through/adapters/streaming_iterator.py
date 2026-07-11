@@ -140,6 +140,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
     sent_content_block_start: bool = False
     sent_content_block_finish: bool = False
     current_content_block_type: Literal["text", "tool_use", "thinking"] = "text"
+    reasoning_roundtrip_emitted: bool = False
     sent_last_message: bool = False
     holding_chunk: Optional[Any] = None
     holding_stop_reason_chunk: Optional[Any] = None
@@ -388,6 +389,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
+                self._maybe_queue_reasoning_roundtrip_block(chunk)
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
                     self._increment_content_block_index()
@@ -473,6 +475,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         }
                     )
                     self.sent_content_block_finish = True
+                    self._maybe_queue_reasoning_roundtrip_block(chunk)
                     if processed_chunk.get("delta", {}).get("stop_reason") is not None:
                         self.holding_stop_reason_chunk = processed_chunk
                     else:
@@ -482,12 +485,14 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 elif self.holding_chunk is not None:
                     self.chunk_queue.append(self.holding_chunk)
                     if processed_chunk.get("type") == "message_delta":
+                        self._maybe_queue_reasoning_roundtrip_block(chunk)
                         processed_chunk = self._augment_message_delta_usage(processed_chunk)
                     self.chunk_queue.append(processed_chunk)
                     self.holding_chunk = None
                     return self.chunk_queue.popleft()
                 else:
                     if processed_chunk.get("type") == "message_delta":
+                        self._maybe_queue_reasoning_roundtrip_block(chunk)
                         processed_chunk = self._augment_message_delta_usage(processed_chunk)
                     self.chunk_queue.append(processed_chunk)
                     return self.chunk_queue.popleft()
@@ -607,6 +612,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
+                self._maybe_queue_reasoning_roundtrip_block(chunk)
                 # Check if we need to start a new content block
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
@@ -686,6 +692,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             }
                         )
                         self.sent_content_block_finish = True
+                        self._maybe_queue_reasoning_roundtrip_block(chunk)
                         if processed_chunk.get("delta", {}).get("stop_reason") is not None:
                             self.holding_stop_reason_chunk = processed_chunk
                         else:
@@ -696,12 +703,14 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         # Queue both chunks
                         self.chunk_queue.append(self.holding_chunk)
                         if processed_chunk.get("type") == "message_delta":
+                            self._maybe_queue_reasoning_roundtrip_block(chunk)
                             processed_chunk = self._augment_message_delta_usage(processed_chunk)
                         self.chunk_queue.append(processed_chunk)
                         self.holding_chunk = None
                         return self.chunk_queue.popleft()
                     else:
                         if processed_chunk.get("type") == "message_delta":
+                            self._maybe_queue_reasoning_roundtrip_block(chunk)
                             processed_chunk = self._augment_message_delta_usage(processed_chunk)
                         self.chunk_queue.append(processed_chunk)
                         return self.chunk_queue.popleft()
@@ -806,6 +815,51 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
     def _increment_content_block_index(self):
         self.current_content_block_index += 1
+
+    def _maybe_queue_reasoning_roundtrip_block(self, raw_chunk: Any) -> None:
+        """Queue one synthetic redacted-thinking block for Responses reasoning."""
+        from . import twork_reasoning_roundtrip
+
+        if self.reasoning_roundtrip_emitted or not twork_reasoning_roundtrip.is_enabled():
+            return
+        try:
+            delta = raw_chunk.choices[0].delta
+            items = getattr(delta, "reasoning_items", None)
+        except Exception:
+            return
+        if not items or getattr(delta, "content", None) or getattr(delta, "tool_calls", None):
+            return
+        packed_data = twork_reasoning_roundtrip.pack_reasoning_items(items)
+        if not packed_data:
+            return
+
+        self.reasoning_roundtrip_emitted = True
+        if not self.sent_content_block_finish:
+            self.chunk_queue.append(
+                {
+                    "type": "content_block_stop",
+                    "index": self.current_content_block_index,
+                }
+            )
+            self.sent_content_block_finish = True
+        self.current_content_block_index += 1
+        block_index = self.current_content_block_index
+        self.chunk_queue.append(
+            {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "redacted_thinking",
+                    "data": packed_data,
+                },
+            }
+        )
+        self.chunk_queue.append(
+            {
+                "type": "content_block_stop",
+                "index": block_index,
+            }
+        )
 
     @staticmethod
     def _trigger_delta_has_content(processed_chunk: Dict[str, Any]) -> bool:

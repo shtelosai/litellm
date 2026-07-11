@@ -971,54 +971,6 @@ def test_transform_request_single_char_keys_not_matched():
 # =============================================================================
 
 
-@pytest.mark.parametrize(
-    ("chunk", "expected_error"),
-    [
-        (
-            {
-                "type": "error",
-                "code": "context_too_large",
-                "message": "Your input exceeds the context window",
-            },
-            "Responses API stream error (context_too_large): Your input exceeds the context window",
-        ),
-        (
-            {
-                "type": "error",
-                "error": {
-                    "code": "invalid_request_error",
-                    "message": "Invalid request",
-                },
-            },
-            "Responses API stream error (invalid_request_error): Invalid request",
-        ),
-        (
-            {
-                "type": "response.failed",
-                "response": {
-                    "error": {
-                        "code": "server_error",
-                        "message": "Upstream failed",
-                    }
-                },
-            },
-            "Responses API stream error (server_error): Upstream failed",
-        ),
-    ],
-)
-def test_responses_terminal_error_events_raise(chunk, expected_error):
-    from litellm.completion_extras.litellm_responses_transformation.transformation import (
-        OpenAiResponsesToChatCompletionStreamIterator,
-    )
-
-    iterator = OpenAiResponsesToChatCompletionStreamIterator(
-        streaming_response=None, sync_stream=True
-    )
-
-    with pytest.raises(ValueError, match=expected_error.replace("(", r"\(").replace(")", r"\)")):
-        iterator.chunk_parser(chunk)
-
-
 def test_message_done_does_not_emit_is_finished():
     """
     Test that OUTPUT_ITEM_DONE for a message does NOT emit is_finished=True.

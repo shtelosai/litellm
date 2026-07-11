@@ -299,6 +299,19 @@ def _assert_marked_thinking_stream(events):
     )
     assert start_pos < md_pos, "合成 redacted_thinking 块必须先于 message_delta"
 
+    open_blocks = set()
+    for event in events:
+        event_type = event["type"]
+        if event_type == "content_block_start":
+            assert event["index"] not in open_blocks, f"content block 重复开始: {events}"
+            open_blocks.add(event["index"])
+        elif event_type == "content_block_delta":
+            assert event["index"] in open_blocks, f"已关闭或未开始的 content block 收到 delta: {events}"
+        elif event_type == "content_block_stop":
+            assert event["index"] in open_blocks, f"content block 未开始便停止或重复停止: {events}"
+            open_blocks.remove(event["index"])
+    assert not open_blocks, f"流结束后仍有未关闭的 content block: {events}"
+
 
 def test_streaming_leg_sync_synthesizes_marked_block():
     _assert_marked_thinking_stream(_collect_events_sync(_bridge_like_chunks()))

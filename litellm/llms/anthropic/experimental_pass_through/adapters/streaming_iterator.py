@@ -861,18 +861,14 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             self.sent_content_block_finish = True
         self.current_content_block_index += 1
         idx = self.current_content_block_index
+        # redacted_thinking carries the packed reasoning items in ``data``;
+        # Anthropic SSE puts the full payload on content_block_start (no delta),
+        # and real SDKs echo redacted_thinking blocks back in multi-turn history.
         self.chunk_queue.append(
             {
                 "type": "content_block_start",
                 "index": idx,
-                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-            }
-        )
-        self.chunk_queue.append(
-            {
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": {"type": "signature_delta", "signature": packed},
+                "content_block": {"type": "redacted_thinking", "data": packed},
             }
         )
         self.chunk_queue.append({"type": "content_block_stop", "index": idx})

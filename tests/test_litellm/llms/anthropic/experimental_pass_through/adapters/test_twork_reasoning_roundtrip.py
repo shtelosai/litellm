@@ -102,7 +102,7 @@ def _anthropic_history_with_marked_block():
         {
             "role": "assistant",
             "content": [
-                {"type": "thinking", "thinking": "(reasoning)", "signature": sig},
+                {"type": "redacted_thinking", "data": sig},
                 {"type": "text", "text": "我来查一下。"},
                 {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"city": "上海"}},
             ],
@@ -121,8 +121,9 @@ def test_request_leg_restores_reasoning_items():
     items = assistant.get("reasoning_items")
     assert items and len(items) == 2
     assert items[0]["encrypted_content"] == "gAAAAA-test-encrypted-payload-001"
-    # 合成块不得作为真 thinking 块转发
+    # 合成块不得作为真 thinking/redacted 块转发
     for tb in assistant.get("thinking_blocks") or []:
+        assert not str(tb.get("data", "")).startswith(rt.SIGNATURE_PREFIX)
         assert not str(tb.get("signature", "")).startswith(rt.SIGNATURE_PREFIX)
 
 
@@ -151,10 +152,10 @@ def test_request_leg_disabled_leaves_marked_block_as_thinking(monkeypatch):
         messages=_anthropic_history_with_marked_block()
     )
     assistant = next(m for m in out if m["role"] == "assistant")
-    # 关闭后走原版路径：不产生 reasoning_items，标记块按普通 thinking 块处理（不崩溃、不 400）
+    # 关闭后走原版路径：不产生 reasoning_items，标记块按普通 redacted_thinking 处理（不崩溃、不 400）
     assert not assistant.get("reasoning_items")
     tbs = assistant.get("thinking_blocks") or []
-    assert any(str(tb.get("signature", "")).startswith(rt.SIGNATURE_PREFIX) for tb in tbs)
+    assert any(str(tb.get("data", "")).startswith(rt.SIGNATURE_PREFIX) for tb in tbs)
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +171,10 @@ def _chat_choice_with_reasoning_items():
 def test_nonstream_response_leg_synthesizes_marked_block():
     adapter = LiteLLMAnthropicMessagesAdapter()
     content = adapter._translate_openai_content_to_anthropic(choices=_chat_choice_with_reasoning_items())
-    thinking = [b for b in content if b.get("type") == "thinking"]
-    assert len(thinking) == 1
-    items = rt.unpack_signature(thinking[0]["signature"])
+    redacted = [b for b in content if b.get("type") == "redacted_thinking"]
+    assert len(redacted) == 1
+    items = rt.unpack_signature(redacted[0]["data"])
     assert items and len(items) == 2
-    assert thinking[0]["thinking"] == "plan the tool call"
     # 文本块保持
     assert any(b.get("type") == "text" and b.get("text") == "上海今天晴。" for b in content)
 
@@ -185,7 +185,7 @@ def test_nonstream_response_leg_disabled(monkeypatch):
         choices=_chat_choice_with_reasoning_items()
     )
     assert not any(
-        str(b.get("signature", "")).startswith(rt.SIGNATURE_PREFIX) for b in content if b.get("type") == "thinking"
+        str(b.get("data", "")).startswith(rt.SIGNATURE_PREFIX) for b in content if b.get("type") == "redacted_thinking"
     )
 
 
@@ -279,27 +279,25 @@ def _collect_events_async(chunks):
 
 
 def _assert_marked_thinking_stream(events):
-    starts = [e for e in events if e["type"] == "content_block_start" and e["content_block"]["type"] == "thinking"]
-    assert len(starts) == 1, f"应恰好一个合成 thinking 块: {events}"
-    idx = starts[0]["index"]
-    sig_deltas = [
+    starts = [
         e
         for e in events
-        if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "signature_delta"
+        if e["type"] == "content_block_start" and e["content_block"]["type"] == "redacted_thinking"
     ]
-    assert len(sig_deltas) == 1 and sig_deltas[0]["index"] == idx
-    items = rt.unpack_signature(sig_deltas[0]["delta"]["signature"])
+    assert len(starts) == 1, f"应恰好一个合成 redacted_thinking 块: {events}"
+    idx = starts[0]["index"]
+    # redacted_thinking 的 data 直接挂在 content_block_start（无 delta）
+    items = rt.unpack_signature(starts[0]["content_block"]["data"])
     assert items and len(items) == 2 and items[0]["encrypted_content"] == "gAAAAA-test-encrypted-payload-001"
-    # SSE 顺序：合成块必须先于 message_delta
-    types = [e["type"] for e in events]
-    assert types.index("content_block_start", types.index("content_block_stop")) < types.index("message_delta") or (
-        [e for e in events if e["type"] == "message_delta"]
-    )
+    # 该块必须闭合，且先于 message_delta
+    assert any(e["type"] == "content_block_stop" and e["index"] == idx for e in events)
     md_pos = next(i for i, e in enumerate(events) if e["type"] == "message_delta")
-    sig_pos = next(
-        i for i, e in enumerate(events) if e["type"] == "content_block_delta" and e["delta"].get("type") == "signature_delta"
+    start_pos = next(
+        i
+        for i, e in enumerate(events)
+        if e["type"] == "content_block_start" and e["content_block"]["type"] == "redacted_thinking"
     )
-    assert sig_pos < md_pos, "合成 thinking 块必须先于 message_delta"
+    assert start_pos < md_pos, "合成 redacted_thinking 块必须先于 message_delta"
 
 
 def test_streaming_leg_sync_synthesizes_marked_block():
@@ -322,7 +320,7 @@ def test_streaming_leg_customstreamwrapper_shape_async():
 def test_streaming_leg_no_reasoning_items_no_synthesis():
     events = _collect_events_sync(_bridge_like_chunks(with_reasoning=False))
     assert not any(
-        e["type"] == "content_block_start" and e["content_block"]["type"] == "thinking" for e in events
+        e["type"] == "content_block_start" and e["content_block"]["type"] == "redacted_thinking" for e in events
     )
 
 
@@ -330,7 +328,7 @@ def test_streaming_leg_disabled(monkeypatch):
     monkeypatch.setenv("LITELLM_TWORK_REASONING_ROUNDTRIP", "0")
     events = _collect_events_sync(_bridge_like_chunks())
     assert not any(
-        e["type"] == "content_block_start" and e["content_block"]["type"] == "thinking" for e in events
+        e["type"] == "content_block_start" and e["content_block"]["type"] == "redacted_thinking" for e in events
     )
 
 

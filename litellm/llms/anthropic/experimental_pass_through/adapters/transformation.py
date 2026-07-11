@@ -556,17 +556,6 @@ class LiteLLMAnthropicMessagesAdapter:
                                 self._add_cache_control_if_applicable(content, tool_call, model)
                                 tool_calls.append(tool_call)
                             elif content.get("type") == "thinking":
-                                # Twork: prefix-marked synthetic blocks carry roundtripped
-                                # Responses reasoning items; restore them instead of
-                                # forwarding as real thinking blocks.
-                                _twork_items = (
-                                    twork_reasoning_roundtrip.unpack_signature(content.get("signature"))
-                                    if twork_reasoning_roundtrip.is_enabled()
-                                    else None
-                                )
-                                if _twork_items:
-                                    twork_reasoning_items.extend(_twork_items)
-                                    continue
                                 thinking_block = ChatCompletionThinkingBlock(
                                     type="thinking",
                                     thinking=content.get("thinking") or "",
@@ -575,6 +564,17 @@ class LiteLLMAnthropicMessagesAdapter:
                                 )
                                 thinking_blocks.append(thinking_block)
                             elif content.get("type") == "redacted_thinking":
+                                # Twork: prefix-marked redacted_thinking carries roundtripped
+                                # Responses reasoning items; restore them instead of
+                                # forwarding as a real redacted block.
+                                _twork_items = (
+                                    twork_reasoning_roundtrip.unpack_signature(content.get("data"))
+                                    if twork_reasoning_roundtrip.is_enabled()
+                                    else None
+                                )
+                                if _twork_items:
+                                    twork_reasoning_items.extend(_twork_items)
+                                    continue
                                 redacted_thinking_block = ChatCompletionRedactedThinkingBlock(
                                     type="redacted_thinking",
                                     data=content.get("data") or "",
@@ -1168,13 +1168,12 @@ class LiteLLMAnthropicMessagesAdapter:
                 else None
             )
             if _twork_r_items:
-                _twork_sig = twork_reasoning_roundtrip.pack_reasoning_items(_twork_r_items)
-                if _twork_sig:
+                _twork_data = twork_reasoning_roundtrip.pack_reasoning_items(_twork_r_items)
+                if _twork_data:
                     new_content.append(
-                        AnthropicResponseContentBlockThinking(
-                            type="thinking",
-                            thinking=twork_reasoning_roundtrip.summary_text(_twork_r_items) or "(reasoning)",
-                            signature=_twork_sig,
+                        AnthropicResponseContentBlockRedactedThinking(
+                            type="redacted_thinking",
+                            data=_twork_data,
                         ).model_dump()
                     )
             # Handle thinking blocks first

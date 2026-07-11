@@ -233,7 +233,7 @@ def _bridge_like_chunks(with_reasoning=True, text="上海今天晴。"):
 
 
 def _customstreamwrapper_shape_chunks(text="上海今天晴。"):
-    """CustomStreamWrapper 重建后的真实形态：内容块 → reasoning-only 块（finish 被剥离）→ 独立 finish 块。"""
+    """CustomStreamWrapper 重建后的真实形态：内容块 → reasoning-only 块 → finish 块 → 空尾块。"""
     text_chunk = ModelResponseStream(
         choices=[StreamingChoices(index=0, delta=Delta(content=text), finish_reason=None)]
     )
@@ -250,7 +250,10 @@ def _customstreamwrapper_shape_chunks(text="上海今天晴。"):
         choices=[StreamingChoices(index=0, delta=Delta(content=""), finish_reason="stop")],
         usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
     )
-    return [text_chunk, reasoning_only, finish_chunk]
+    trailing_empty = ModelResponseStream(
+        choices=[StreamingChoices(index=0, delta=Delta(content=""), finish_reason=None)]
+    )
+    return [text_chunk, reasoning_only, finish_chunk, trailing_empty]
 
 
 def _collect_events_sync(chunks):

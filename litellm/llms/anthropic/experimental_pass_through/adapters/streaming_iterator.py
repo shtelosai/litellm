@@ -389,7 +389,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
-                queued_reasoning_roundtrip = self._maybe_queue_reasoning_roundtrip_block(chunk)
+                self._maybe_queue_reasoning_roundtrip_block(chunk)
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
                     self._increment_content_block_index()
@@ -428,13 +428,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                     # ``not self.queued_usage_chunk``.
                     continue
 
-                if (
-                    queued_reasoning_roundtrip
-                    and processed_chunk.get("type") == "content_block_delta"
-                    and not self._trigger_delta_has_content(processed_chunk)
-                ):
-                    return self.chunk_queue.popleft()
-
                 if should_start_new_block and not self.sent_content_block_finish:
                     # Queue the sequence: content_block_stop -> content_block_start
                     # -> (optionally) the trigger chunk's delta.
@@ -472,6 +465,13 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
                     self.sent_content_block_finish = False
                     return self.chunk_queue.popleft()
+
+                if processed_chunk.get("type") == "content_block_delta" and not self._trigger_delta_has_content(
+                    processed_chunk
+                ):
+                    if self.chunk_queue:
+                        return self.chunk_queue.popleft()
+                    continue
 
                 if processed_chunk["type"] == "message_delta" and self.sent_content_block_finish is False:
                     # Queue both the content_block_stop and the message_delta
@@ -619,7 +619,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
-                queued_reasoning_roundtrip = self._maybe_queue_reasoning_roundtrip_block(chunk)
+                self._maybe_queue_reasoning_roundtrip_block(chunk)
                 # Check if we need to start a new content block
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
@@ -653,13 +653,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 # Check if this processed chunk has a stop_reason - hold it for next chunk
 
                 if not self.queued_usage_chunk:
-                    if (
-                        queued_reasoning_roundtrip
-                        and processed_chunk.get("type") == "content_block_delta"
-                        and not self._trigger_delta_has_content(processed_chunk)
-                    ):
-                        return self.chunk_queue.popleft()
-
                     if should_start_new_block and not self.sent_content_block_finish:
                         # Queue the sequence: content_block_stop -> content_block_start
                         # -> (optionally) the trigger chunk's delta.
@@ -696,6 +689,13 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         # Reset state for new block
                         self.sent_content_block_finish = False
                         return self.chunk_queue.popleft()
+
+                    if processed_chunk.get("type") == "content_block_delta" and not self._trigger_delta_has_content(
+                        processed_chunk
+                    ):
+                        if self.chunk_queue:
+                            return self.chunk_queue.popleft()
+                        continue
 
                     if processed_chunk["type"] == "message_delta" and self.sent_content_block_finish is False:
                         # Queue both the content_block_stop and the holding chunk
@@ -830,24 +830,24 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
     def _increment_content_block_index(self):
         self.current_content_block_index += 1
 
-    def _maybe_queue_reasoning_roundtrip_block(self, raw_chunk: Any) -> bool:
+    def _maybe_queue_reasoning_roundtrip_block(self, raw_chunk: Any) -> None:
         """Queue one synthetic redacted-thinking block for Responses reasoning."""
         from . import twork_reasoning_roundtrip
 
         if self.reasoning_roundtrip_emitted or not twork_reasoning_roundtrip.is_enabled():
-            return False
+            return
         choices = getattr(raw_chunk, "choices", None)
         if not choices:
-            return False
+            return
         delta = getattr(choices[0], "delta", None)
         if delta is None:
-            return False
+            return
         items = getattr(delta, "reasoning_items", None)
         if not items or getattr(delta, "content", None) or getattr(delta, "tool_calls", None):
-            return False
+            return
         packed_data = twork_reasoning_roundtrip.pack_reasoning_items(items)
         if not packed_data:
-            return False
+            return
 
         self.reasoning_roundtrip_emitted = True
         if not self.sent_content_block_finish:
@@ -876,7 +876,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 "index": block_index,
             }
         )
-        return True
 
     @staticmethod
     def _trigger_delta_has_content(processed_chunk: Dict[str, Any]) -> bool:

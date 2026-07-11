@@ -821,3 +821,73 @@ def test_gate_passthrough_skipped_when_only_chat_completions_supported(monkeypat
     assert result == "translated"
     assert translation_calls["count"] == 1
     assert "config" not in captured
+
+
+class TestReasoningEncryptedContentRequest:
+    def test_anthropic_responses_bridge_requests_encrypted_content(self):
+        from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+            LiteLLMMessagesToCompletionTransformationHandler,
+        )
+
+        completion_kwargs, _ = LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+            max_tokens=1024,
+            messages=[{"role": "user", "content": "hello"}],
+            model="openai/gpt-5.2",
+            thinking={"type": "enabled", "budget_tokens": 5000},
+            extra_kwargs={"custom_llm_provider": "openai"},
+        )
+
+        assert completion_kwargs["model"] == "responses/openai/gpt-5.2"
+        assert completion_kwargs["include"] == ["reasoning.encrypted_content"]
+
+    def test_anthropic_responses_bridge_preserves_existing_include(self):
+        from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+            LiteLLMMessagesToCompletionTransformationHandler,
+        )
+
+        completion_kwargs, _ = LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+            max_tokens=1024,
+            messages=[{"role": "user", "content": "hello"}],
+            model="openai/gpt-5.2",
+            thinking={"type": "enabled", "budget_tokens": 5000},
+            extra_kwargs={
+                "custom_llm_provider": "openai",
+                "include": ["web_search_call.action.sources", "reasoning.encrypted_content"],
+            },
+        )
+
+        assert completion_kwargs["include"] == [
+            "web_search_call.action.sources",
+            "reasoning.encrypted_content",
+        ]
+
+    def test_anthropic_responses_bridge_kill_switch_disables_include(self, monkeypatch):
+        from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+            LiteLLMMessagesToCompletionTransformationHandler,
+        )
+
+        monkeypatch.setenv("LITELLM_TWORK_REASONING_ROUNDTRIP", "0")
+        completion_kwargs, _ = LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+            max_tokens=1024,
+            messages=[{"role": "user", "content": "hello"}],
+            model="openai/gpt-5.2",
+            thinking={"type": "enabled", "budget_tokens": 5000},
+            extra_kwargs={"custom_llm_provider": "openai"},
+        )
+
+        assert "include" not in completion_kwargs
+
+    def test_non_responses_request_does_not_request_encrypted_content(self):
+        from litellm.llms.anthropic.experimental_pass_through.adapters.handler import (
+            LiteLLMMessagesToCompletionTransformationHandler,
+        )
+
+        completion_kwargs, _ = LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+            max_tokens=1024,
+            messages=[{"role": "user", "content": "hello"}],
+            model="openai/gpt-4o",
+            extra_kwargs={"custom_llm_provider": "openai"},
+        )
+
+        assert completion_kwargs["model"] == "openai/gpt-4o"
+        assert "include" not in completion_kwargs

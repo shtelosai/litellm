@@ -383,7 +383,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         if isinstance(metadata, dict) and "user_id" in metadata:
             responses_kwargs["user"] = str(metadata["user_id"])[:64]
 
-        return responses_kwargs
+        return twork_reasoning_roundtrip.with_encrypted_content_include(responses_kwargs)
 
     # ------------------------------------------------------------------ #
     # Response translation: Responses API -> Anthropic                    #

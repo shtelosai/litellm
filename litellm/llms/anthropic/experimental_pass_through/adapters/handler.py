@@ -32,6 +32,8 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 from litellm.types.utils import ModelResponse
 from litellm.utils import get_model_info
 
+from . import twork_reasoning_roundtrip
+
 if TYPE_CHECKING:
     pass
 
@@ -523,6 +525,10 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             completion_kwargs,
             thinking=thinking,
         )
+
+        routed_model = completion_kwargs.get("model")
+        if isinstance(routed_model, str) and routed_model.startswith("responses/"):
+            completion_kwargs = twork_reasoning_roundtrip.with_encrypted_content_include(completion_kwargs)
 
         return completion_kwargs, tool_name_mapping
 

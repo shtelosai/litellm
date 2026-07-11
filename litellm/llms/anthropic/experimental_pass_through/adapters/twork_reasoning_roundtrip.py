@@ -24,11 +24,22 @@ from typing import Any, Dict, List, Optional
 SIGNATURE_PREFIX = "tworkrs1:"
 
 _ENV_FLAG = "LITELLM_TWORK_REASONING_ROUNDTRIP"
+_ENCRYPTED_CONTENT_INCLUDE = "reasoning.encrypted_content"
 
 
 def is_enabled() -> bool:
     """Feature flag, default on. ``LITELLM_TWORK_REASONING_ROUNDTRIP=0`` disables."""
     return os.getenv(_ENV_FLAG, "1") != "0"
+
+
+def with_encrypted_content_include(params: Dict[str, Any]) -> Dict[str, Any]:
+    if not is_enabled():
+        return params
+    include = params.get("include")
+    existing = include if isinstance(include, list) else []
+    if _ENCRYPTED_CONTENT_INCLUDE in existing:
+        return params
+    return {**params, "include": [*existing, _ENCRYPTED_CONTENT_INCLUDE]}
 
 
 def _get(item: Any, key: str) -> Any:

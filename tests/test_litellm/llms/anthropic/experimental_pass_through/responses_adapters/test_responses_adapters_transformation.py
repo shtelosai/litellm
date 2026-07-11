@@ -1128,3 +1128,14 @@ class TestTranslateResponse:
         assert "text" in types
         assert "tool_use" in types
         assert result["stop_reason"] == "tool_use"
+
+
+class TestReasoningEncryptedContentRequest:
+    def test_requests_encrypted_reasoning_content(self):
+        kwargs = _ADAPTER.translate_request(_make_request())
+        assert kwargs["include"] == ["reasoning.encrypted_content"]
+
+    def test_kill_switch_disables_encrypted_reasoning_include(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_TWORK_REASONING_ROUNDTRIP", "0")
+        kwargs = _ADAPTER.translate_request(_make_request())
+        assert "include" not in kwargs

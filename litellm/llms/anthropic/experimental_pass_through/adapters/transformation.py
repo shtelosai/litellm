@@ -138,6 +138,9 @@ from .streaming_iterator import AnthropicStreamWrapper
 if TYPE_CHECKING:
     from litellm.types.llms.anthropic import ContentBlockContentBlockDict
 
+from . import twork_reasoning_roundtrip
+
+
 
 class AnthropicAdapter:
     def __init__(self) -> None:
@@ -511,6 +514,7 @@ class LiteLLMAnthropicMessagesAdapter:
             has_cache_control_in_text = False
             tool_calls: List[ChatCompletionAssistantToolCall] = []
             thinking_blocks: List[Union[ChatCompletionThinkingBlock, ChatCompletionRedactedThinkingBlock]] = []
+            twork_reasoning_items: List[Dict[str, Any]] = []  # Twork: roundtripped Responses reasoning items
             if m["role"] == "assistant":
                 if isinstance(m.get("content"), str):
                     assistant_message_str = str(m.get("content", ""))
@@ -552,6 +556,17 @@ class LiteLLMAnthropicMessagesAdapter:
                                 self._add_cache_control_if_applicable(content, tool_call, model)
                                 tool_calls.append(tool_call)
                             elif content.get("type") == "thinking":
+                                # Twork: prefix-marked synthetic blocks carry roundtripped
+                                # Responses reasoning items; restore them instead of
+                                # forwarding as real thinking blocks.
+                                _twork_items = (
+                                    twork_reasoning_roundtrip.unpack_signature(content.get("signature"))
+                                    if twork_reasoning_roundtrip.is_enabled()
+                                    else None
+                                )
+                                if _twork_items:
+                                    twork_reasoning_items.extend(_twork_items)
+                                    continue
                                 thinking_block = ChatCompletionThinkingBlock(
                                     type="thinking",
                                     thinking=content.get("thinking") or "",
@@ -572,6 +587,7 @@ class LiteLLMAnthropicMessagesAdapter:
                 or len(assistant_content_list) > 0
                 or len(tool_calls) > 0
                 or len(thinking_blocks) > 0
+                or len(twork_reasoning_items) > 0
             ):
                 # Use list format if any text block has cache_control, otherwise use string
                 if has_cache_control_in_text and len(assistant_content_list) > 0:
@@ -591,6 +607,9 @@ class LiteLLMAnthropicMessagesAdapter:
                     assistant_message["tool_calls"] = tool_calls  # type: ignore
                 if len(thinking_blocks) > 0:
                     assistant_message["thinking_blocks"] = thinking_blocks  # type: ignore
+                if len(twork_reasoning_items) > 0:
+                    # Twork: consumed by the Responses bridge (reasoning_items roundtrip)
+                    assistant_message["reasoning_items"] = twork_reasoning_items  # type: ignore
                 new_messages.append(assistant_message)
 
         return new_messages
@@ -1141,6 +1160,23 @@ class LiteLLMAnthropicMessagesAdapter:
     ) -> List[Dict[str, Any]]:
         new_content: List[Dict[str, Any]] = []
         for choice in choices:
+            # Twork: surface roundtripped Responses reasoning items as a
+            # prefix-marked synthetic thinking block (non-streaming path).
+            _twork_r_items = (
+                getattr(choice.message, "reasoning_items", None)
+                if twork_reasoning_roundtrip.is_enabled()
+                else None
+            )
+            if _twork_r_items:
+                _twork_sig = twork_reasoning_roundtrip.pack_reasoning_items(_twork_r_items)
+                if _twork_sig:
+                    new_content.append(
+                        AnthropicResponseContentBlockThinking(
+                            type="thinking",
+                            thinking=twork_reasoning_roundtrip.summary_text(_twork_r_items) or "(reasoning)",
+                            signature=_twork_sig,
+                        ).model_dump()
+                    )
             # Handle thinking blocks first
             if hasattr(choice.message, "thinking_blocks") and choice.message.thinking_blocks:
                 for thinking_block in choice.message.thinking_blocks:

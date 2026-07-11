@@ -140,6 +140,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
     sent_content_block_start: bool = False
     sent_content_block_finish: bool = False
     current_content_block_type: Literal["text", "tool_use", "thinking"] = "text"
+    _twork_reasoning_emitted: bool = False  # Twork: reasoning roundtrip emitted once per stream
     sent_last_message: bool = False
     holding_chunk: Optional[Any] = None
     holding_stop_reason_chunk: Optional[Any] = None
@@ -473,6 +474,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         }
                     )
                     self.sent_content_block_finish = True
+                    self._maybe_queue_twork_reasoning_block(chunk)
                     if processed_chunk.get("delta", {}).get("stop_reason") is not None:
                         self.holding_stop_reason_chunk = processed_chunk
                     else:
@@ -482,12 +484,14 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 elif self.holding_chunk is not None:
                     self.chunk_queue.append(self.holding_chunk)
                     if processed_chunk.get("type") == "message_delta":
+                        self._maybe_queue_twork_reasoning_block(chunk)
                         processed_chunk = self._augment_message_delta_usage(processed_chunk)
                     self.chunk_queue.append(processed_chunk)
                     self.holding_chunk = None
                     return self.chunk_queue.popleft()
                 else:
                     if processed_chunk.get("type") == "message_delta":
+                        self._maybe_queue_twork_reasoning_block(chunk)
                         processed_chunk = self._augment_message_delta_usage(processed_chunk)
                     self.chunk_queue.append(processed_chunk)
                     return self.chunk_queue.popleft()
@@ -686,6 +690,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             }
                         )
                         self.sent_content_block_finish = True
+                        self._maybe_queue_twork_reasoning_block(chunk)
                         if processed_chunk.get("delta", {}).get("stop_reason") is not None:
                             self.holding_stop_reason_chunk = processed_chunk
                         else:
@@ -696,12 +701,14 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         # Queue both chunks
                         self.chunk_queue.append(self.holding_chunk)
                         if processed_chunk.get("type") == "message_delta":
+                            self._maybe_queue_twork_reasoning_block(chunk)
                             processed_chunk = self._augment_message_delta_usage(processed_chunk)
                         self.chunk_queue.append(processed_chunk)
                         self.holding_chunk = None
                         return self.chunk_queue.popleft()
                     else:
                         if processed_chunk.get("type") == "message_delta":
+                            self._maybe_queue_twork_reasoning_block(chunk)
                             processed_chunk = self._augment_message_delta_usage(processed_chunk)
                         self.chunk_queue.append(processed_chunk)
                         return self.chunk_queue.popleft()
@@ -806,6 +813,49 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
     def _increment_content_block_index(self):
         self.current_content_block_index += 1
+
+    def _maybe_queue_twork_reasoning_block(self, raw_chunk: Any) -> None:
+        """Twork: surface roundtripped Responses reasoning items on the final chunk
+        as a synthetic prefix-marked thinking block (streaming path).
+
+        Anthropic-adapter-only by construction: this wrapper never runs for plain
+        ``/chat/completions`` clients. Emits at most once per stream. See
+        twork_reasoning_roundtrip module docs / upstream issue #24425.
+        """
+        from . import twork_reasoning_roundtrip
+
+        if self._twork_reasoning_emitted:
+            return
+        if not twork_reasoning_roundtrip.is_enabled():
+            return
+        try:
+            delta = raw_chunk.choices[0].delta
+            items = getattr(delta, "reasoning_items", None)
+        except Exception:
+            return
+        if not items:
+            return
+        packed = twork_reasoning_roundtrip.pack_reasoning_items(items)
+        if not packed:
+            return
+        self._twork_reasoning_emitted = True
+        self.current_content_block_index += 1
+        idx = self.current_content_block_index
+        self.chunk_queue.append(
+            {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            }
+        )
+        self.chunk_queue.append(
+            {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "signature_delta", "signature": packed},
+            }
+        )
+        self.chunk_queue.append({"type": "content_block_stop", "index": idx})
 
     @staticmethod
     def _trigger_delta_has_content(processed_chunk: Dict[str, Any]) -> bool:

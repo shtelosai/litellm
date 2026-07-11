@@ -389,6 +389,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
+                self._maybe_queue_twork_reasoning_block(chunk)
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
                     self._increment_content_block_index()
@@ -611,6 +612,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
+                self._maybe_queue_twork_reasoning_block(chunk)
                 # Check if we need to start a new content block
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
@@ -815,12 +817,19 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         self.current_content_block_index += 1
 
     def _maybe_queue_twork_reasoning_block(self, raw_chunk: Any) -> None:
-        """Twork: surface roundtripped Responses reasoning items on the final chunk
-        as a synthetic prefix-marked thinking block (streaming path).
+        """Twork: surface roundtripped Responses reasoning items as a synthetic
+        prefix-marked thinking block (streaming path).
 
-        Anthropic-adapter-only by construction: this wrapper never runs for plain
-        ``/chat/completions`` clients. Emits at most once per stream. See
-        twork_reasoning_roundtrip module docs / upstream issue #24425.
+        CustomStreamWrapper rebuilds the bridge's final chunk into a
+        content-less chunk that keeps ``delta.reasoning_items`` but has its
+        ``finish_reason`` stripped (emitted later as a separate synthetic
+        finish chunk), so this must trigger on any reasoning-bearing chunk —
+        not only on ``message_delta``. Only fires when the chunk carries no
+        visible content/tool deltas, and at most once per stream.
+
+        Anthropic-adapter-only by construction: this wrapper never runs for
+        plain ``/chat/completions`` clients. See twork_reasoning_roundtrip
+        module docs / upstream issue #24425.
         """
         from . import twork_reasoning_roundtrip
 
@@ -835,10 +844,21 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             return
         if not items:
             return
+        # 携带可见增量的 chunk 不在此处理，避免把同 chunk 的文本/工具增量写进已关闭的块
+        if getattr(delta, "content", None) or getattr(delta, "tool_calls", None):
+            return
         packed = twork_reasoning_roundtrip.pack_reasoning_items(items)
         if not packed:
             return
         self._twork_reasoning_emitted = True
+        if not self.sent_content_block_finish:
+            self.chunk_queue.append(
+                {
+                    "type": "content_block_stop",
+                    "index": self.current_content_block_index,
+                }
+            )
+            self.sent_content_block_finish = True
         self.current_content_block_index += 1
         idx = self.current_content_block_index
         self.chunk_queue.append(
@@ -856,7 +876,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             }
         )
         self.chunk_queue.append({"type": "content_block_stop", "index": idx})
-
     @staticmethod
     def _trigger_delta_has_content(processed_chunk: Dict[str, Any]) -> bool:
         """Return True if a translated trigger chunk carries a non-empty

@@ -232,6 +232,27 @@ def _bridge_like_chunks(with_reasoning=True, text="上海今天晴。"):
     return [text_chunk, final]
 
 
+def _customstreamwrapper_shape_chunks(text="上海今天晴。"):
+    """CustomStreamWrapper 重建后的真实形态：内容块 → reasoning-only 块（finish 被剥离）→ 独立 finish 块。"""
+    text_chunk = ModelResponseStream(
+        choices=[StreamingChoices(index=0, delta=Delta(content=text), finish_reason=None)]
+    )
+    reasoning_only = ModelResponseStream(
+        choices=[
+            StreamingChoices(
+                index=0,
+                delta=Delta(content="", reasoning_items=REASONING_ITEMS),
+                finish_reason=None,
+            )
+        ]
+    )
+    finish_chunk = ModelResponseStream(
+        choices=[StreamingChoices(index=0, delta=Delta(content=""), finish_reason="stop")],
+        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+    return [text_chunk, reasoning_only, finish_chunk]
+
+
 def _collect_events_sync(chunks):
     wrapper = AnthropicStreamWrapper(completion_stream=_ListStream(chunks), model="gpt-5.6-sol")
     events = []
@@ -287,6 +308,15 @@ def test_streaming_leg_sync_synthesizes_marked_block():
 
 def test_streaming_leg_async_synthesizes_marked_block():
     _assert_marked_thinking_stream(_collect_events_async(_bridge_like_chunks()))
+
+
+def test_streaming_leg_customstreamwrapper_shape_sync():
+    """生产真实链路形态（finish 与 reasoning_items 被 CustomStreamWrapper 拆分）也必须合成。"""
+    _assert_marked_thinking_stream(_collect_events_sync(_customstreamwrapper_shape_chunks()))
+
+
+def test_streaming_leg_customstreamwrapper_shape_async():
+    _assert_marked_thinking_stream(_collect_events_async(_customstreamwrapper_shape_chunks()))
 
 
 def test_streaming_leg_no_reasoning_items_no_synthesis():

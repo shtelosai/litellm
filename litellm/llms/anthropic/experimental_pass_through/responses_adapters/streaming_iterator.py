@@ -7,6 +7,9 @@ from typing import Any, AsyncIterator, Dict
 
 from litellm import verbose_logger
 from litellm._uuid import uuid
+from litellm.llms.anthropic.experimental_pass_through.adapters import (
+    twork_reasoning_roundtrip,
+)
 
 
 class AnthropicResponsesStreamWrapper:
@@ -72,6 +75,32 @@ class AnthropicResponsesStreamWrapper:
 
         if event_type is None:
             return
+
+        if event_type in ("error", "response.failed"):
+            error_payload = event.get("error") if isinstance(event, dict) else getattr(event, "error", None)
+            if error_payload is None:
+                response_payload = (
+                    event.get("response") if isinstance(event, dict) else getattr(event, "response", None)
+                )
+                error_payload = (
+                    response_payload.get("error")
+                    if isinstance(response_payload, dict)
+                    else getattr(response_payload, "error", None)
+                )
+            error_code = (
+                error_payload.get("code") or error_payload.get("type")
+                if isinstance(error_payload, dict)
+                else getattr(error_payload, "code", None) or getattr(error_payload, "type", None)
+            )
+            error_message = (
+                error_payload.get("message")
+                if isinstance(error_payload, dict)
+                else getattr(error_payload, "message", None)
+            )
+            raise ValueError(
+                f"Responses API stream error ({error_code or event_type}): "
+                f"{error_message or 'Unknown upstream error'}"
+            )
 
         # ---- message_start ----
         if event_type == "response.created":
@@ -199,6 +228,9 @@ class AnthropicResponsesStreamWrapper:
         # ---- output item done -> content_block_stop ----
         if event_type == "response.output_item.done":
             item = getattr(event, "item", None) or (event.get("item") if isinstance(event, dict) else None)
+            item_type = (
+                getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None) if item else None
+            )
             item_id = (
                 getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else None) if item else None
             )
@@ -213,6 +245,26 @@ class AnthropicResponsesStreamWrapper:
                     "index": block_idx,
                 }
             )
+            if item_type == "reasoning" and twork_reasoning_roundtrip.is_enabled():
+                packed_data = twork_reasoning_roundtrip.pack_reasoning_items([item])
+                if packed_data:
+                    redacted_block_idx = self._next_block_index()
+                    self._chunk_queue.append(
+                        {
+                            "type": "content_block_start",
+                            "index": redacted_block_idx,
+                            "content_block": {
+                                "type": "redacted_thinking",
+                                "data": packed_data,
+                            },
+                        }
+                    )
+                    self._chunk_queue.append(
+                        {
+                            "type": "content_block_stop",
+                            "index": redacted_block_idx,
+                        }
+                    )
             return
 
         # ---- response completed -> message_delta + message_stop ----
@@ -299,6 +351,7 @@ class AnthropicResponsesStreamWrapper:
             pass
         except Exception as e:
             verbose_logger.error(f"AnthropicResponsesStreamWrapper error: {e}\n{traceback.format_exc()}")
+            raise
 
         # Drain any remaining queued chunks
         if self._chunk_queue:

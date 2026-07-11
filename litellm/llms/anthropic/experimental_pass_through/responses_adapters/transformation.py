@@ -14,6 +14,9 @@ from litellm.litellm_core_utils.reasoning_effort_utils import (
 from litellm.llms.anthropic.experimental_pass_through.utils import (
     is_reasoning_auto_summary_enabled,
 )
+from litellm.llms.anthropic.experimental_pass_through.adapters import (
+    twork_reasoning_roundtrip,
+)
 from litellm.types.llms.anthropic import (
     AllAnthropicToolsValues,
     AnthopicMessagesAssistantMessageParam,
@@ -23,6 +26,7 @@ from litellm.types.llms.anthropic import (
     AnthropicMessagesUserMessageParam,
     AnthropicResponseContentBlockText,
     AnthropicResponseContentBlockThinking,
+    AnthropicResponseContentBlockRedactedThinking,
     AnthropicResponseContentBlockToolUse,
 )
 from litellm.types.llms.anthropic_messages.anthropic_response import (
@@ -162,6 +166,10 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                             thinking_text = block.get("thinking", "")
                             if thinking_text:
                                 asst_parts.append({"type": "output_text", "text": thinking_text})
+                        elif btype == "redacted_thinking" and twork_reasoning_roundtrip.is_enabled():
+                            reasoning_items = twork_reasoning_roundtrip.unpack_signature(block.get("data"))
+                            if reasoning_items:
+                                input_items.extend(reasoning_items)
                     if asst_parts:
                         input_items.append(
                             {
@@ -401,6 +409,18 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
         for item in response.output:
             if isinstance(item, ResponseReasoningItem):
+                packed_data = (
+                    twork_reasoning_roundtrip.pack_reasoning_items([item])
+                    if twork_reasoning_roundtrip.is_enabled()
+                    else None
+                )
+                if packed_data:
+                    content.append(
+                        AnthropicResponseContentBlockRedactedThinking(
+                            type="redacted_thinking",
+                            data=packed_data,
+                        ).model_dump()
+                    )
                 for summary in item.summary:
                     text = getattr(summary, "text", "")
                     if text:
@@ -436,7 +456,30 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
             elif isinstance(item, dict):
                 item_type = item.get("type")
-                if item_type == "message":
+                if item_type == "reasoning":
+                    packed_data = (
+                        twork_reasoning_roundtrip.pack_reasoning_items([item])
+                        if twork_reasoning_roundtrip.is_enabled()
+                        else None
+                    )
+                    if packed_data:
+                        content.append(
+                            AnthropicResponseContentBlockRedactedThinking(
+                                type="redacted_thinking",
+                                data=packed_data,
+                            ).model_dump()
+                        )
+                    for summary in item.get("summary", []):
+                        text = summary.get("text", "") if isinstance(summary, dict) else ""
+                        if text:
+                            content.append(
+                                AnthropicResponseContentBlockThinking(
+                                    type="thinking",
+                                    thinking=text,
+                                    signature=None,
+                                ).model_dump()
+                            )
+                elif item_type == "message":
                     for part in item.get("content", []):
                         if isinstance(part, dict) and part.get("type") == "output_text":
                             content.append(

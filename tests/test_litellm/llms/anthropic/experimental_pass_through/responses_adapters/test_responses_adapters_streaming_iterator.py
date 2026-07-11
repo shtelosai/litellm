@@ -6,12 +6,17 @@ Tests for AnthropicResponsesStreamWrapper
 import os
 import sys
 
+import pytest
+
 sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../.."))
 )
 
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
     AnthropicResponsesStreamWrapper,
+)
+from litellm.llms.anthropic.experimental_pass_through.adapters import (
+    twork_reasoning_roundtrip as reasoning_roundtrip,
 )
 
 
@@ -49,6 +54,7 @@ class TestProcessEventTextDeltaWithoutOutputItemAdded:
             ("content_block_delta", 0),
         ]
 
+
     def test_process_event_unregistered_item_id_opens_new_text_block(self):
         chunks = _process_all(
             [
@@ -77,3 +83,70 @@ class TestProcessEventTextDeltaWithoutOutputItemAdded:
             ("content_block_start", 0),
             ("content_block_delta", 0),
         ]
+
+
+def test_reasoning_output_item_done_adds_roundtrip_block():
+    chunks = _process_all(
+        [
+            {
+                "type": "response.output_item.added",
+                "item": {"type": "reasoning", "id": "rs_stream_native"},
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_stream_native",
+                    "encrypted_content": "encrypted-stream-native",
+                    "summary": [],
+                },
+            },
+        ]
+    )
+    redacted = [
+        chunk
+        for chunk in chunks
+        if chunk["type"] == "content_block_start"
+        and chunk["content_block"]["type"] == "redacted_thinking"
+    ]
+    assert len(redacted) == 1
+    unpacked = reasoning_roundtrip.unpack_signature(
+        redacted[0]["content_block"]["data"]
+    )
+    assert unpacked and unpacked[0]["encrypted_content"] == "encrypted-stream-native"
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_error"),
+    [
+        (
+            {
+                "type": "error",
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": "Invalid request",
+                },
+            },
+            "Responses API stream error (invalid_request_error): Invalid request",
+        ),
+        (
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {"code": "server_error", "message": "Upstream failed"}
+                },
+            },
+            "Responses API stream error (server_error): Upstream failed",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_error_event_is_propagated(event, expected_error):
+    async def _stream():
+        yield event
+
+    wrapper = AnthropicResponsesStreamWrapper(responses_stream=_stream(), model="m")
+    wrapper._sent_message_start = True
+
+    with pytest.raises(ValueError, match=expected_error.replace("(", r"\(").replace(")", r"\)")):
+        await wrapper.__anext__()

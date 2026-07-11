@@ -6,7 +6,7 @@ Tests for LiteLLMAnthropicToResponsesAPIAdapter
 import json
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.abspath("../../../../../../.."))
@@ -18,6 +18,9 @@ from litellm.constants import (
 )
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (
     LiteLLMAnthropicToResponsesAPIAdapter,
+)
+from litellm.llms.anthropic.experimental_pass_through.adapters import (
+    twork_reasoning_roundtrip as reasoning_roundtrip,
 )
 from litellm.types.llms.anthropic import AnthropicMessagesRequest
 
@@ -424,6 +427,36 @@ class TestTranslateMessagesToResponsesInput:
         ]
         result = _translate_messages(messages)
         assert result == []
+
+    def test_assistant_marked_redacted_thinking_becomes_reasoning_item(self):
+        packed = reasoning_roundtrip.pack_reasoning_items(
+            [
+                {
+                    "id": "rs_native_1",
+                    "type": "reasoning",
+                    "encrypted_content": "encrypted-native-1",
+                    "summary": [],
+                }
+            ]
+        )
+        result = _translate_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": packed},
+                        {"type": "text", "text": "Calling a tool."},
+                    ],
+                }
+            ]
+        )
+        assert result[0] == {
+            "id": "rs_native_1",
+            "type": "reasoning",
+            "encrypted_content": "encrypted-native-1",
+            "summary": [],
+        }
+        assert result[1]["type"] == "message"
 
     def test_mixed_messages_ordering(self):
         """Full multi-turn conversation is converted in order."""
@@ -901,7 +934,9 @@ def _make_function_call_item(call_id: str, name: str, arguments: str) -> MagicMo
     return item
 
 
-def _make_reasoning_item(summaries: List[str]) -> MagicMock:
+def _make_reasoning_item(
+    summaries: List[str], encrypted_content: Optional[str] = None
+) -> MagicMock:
     """Build a mock ResponseReasoningItem."""
     from openai.types.responses import ResponseReasoningItem  # type: ignore[import]
 
@@ -912,7 +947,9 @@ def _make_reasoning_item(summaries: List[str]) -> MagicMock:
         summary_mocks.append(s)
 
     item = MagicMock(spec=ResponseReasoningItem)
+    item.id = "rs_response_1"
     item.summary = summary_mocks
+    item.encrypted_content = encrypted_content
     return item
 
 
@@ -979,6 +1016,26 @@ class TestTranslateResponse:
         assert len(result["content"]) == 1
         assert result["content"][0]["type"] == "thinking"
         assert "Step 1" in result["content"][0]["thinking"]
+
+    def test_reasoning_item_with_encrypted_content_adds_roundtrip_block(self):
+        reasoning = _make_reasoning_item(
+            ["Internal summary"], encrypted_content="encrypted-response-1"
+        )
+        response = _make_mock_response(output=[reasoning])
+        result: Any = _ADAPTER.translate_response(response)
+        redacted = [
+            block for block in result["content"] if block["type"] == "redacted_thinking"
+        ]
+        assert len(redacted) == 1
+        unpacked = reasoning_roundtrip.unpack_signature(redacted[0]["data"])
+        assert unpacked == [
+            {
+                "id": "rs_response_1",
+                "type": "reasoning",
+                "encrypted_content": "encrypted-response-1",
+                "summary": [],
+            }
+        ]
 
     def test_empty_reasoning_summary_skipped(self):
         """Reasoning item with empty text summary is not added to content."""

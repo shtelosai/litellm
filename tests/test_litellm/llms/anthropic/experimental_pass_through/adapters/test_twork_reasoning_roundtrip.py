@@ -335,6 +335,83 @@ def test_streaming_leg_disabled(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# bridge 迭代器：output_item.done 形态的 reasoning 累积（上游两种下发形态之一）
+# ---------------------------------------------------------------------------
+
+
+def test_bridge_iterator_accumulates_output_item_reasoning():
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    it = OpenAiResponsesToChatCompletionStreamIterator(None, sync_stream=True)
+    # reasoning 只出现在 output_item.done 事件（completed 输出不含）
+    it.chunk_parser(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "rs_stream01",
+                "type": "reasoning",
+                "content": [],
+                "encrypted_content": "EC-STREAM-01",
+                "summary": [{"type": "summary_text", "text": "streamed"}],
+            },
+        }
+    )
+    final = it.chunk_parser(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_x",
+                "status": "completed",
+                "output": [
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            },
+        }
+    )
+    assert final.choices[0].finish_reason is not None
+    items = getattr(final.choices[0].delta, "reasoning_items", None)
+    assert items and items[0]["id"] == "rs_stream01"
+    assert items[0]["encrypted_content"] == "EC-STREAM-01"
+
+
+def test_bridge_iterator_merges_without_duplicating_completed_items():
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    it = OpenAiResponsesToChatCompletionStreamIterator(None, sync_stream=True)
+    it.chunk_parser(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {"id": "rs_dup", "type": "reasoning", "content": [], "encrypted_content": "EC-DUP", "summary": []},
+        }
+    )
+    # completed 输出里也带同 id 的 reasoning（另一种上游形态）→ 不应重复
+    final = it.chunk_parser(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_y",
+                "status": "completed",
+                "output": [
+                    {"id": "rs_dup", "type": "reasoning", "content": [], "encrypted_content": "EC-DUP", "summary": []},
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            },
+        }
+    )
+    items = getattr(final.choices[0].delta, "reasoning_items", None)
+    assert items is not None
+    assert [r["id"] for r in items].count("rs_dup") == 1
+
+
+# ---------------------------------------------------------------------------
 # 跨层可达性 + 并发隔离（Codex 闸门测试，按本设计等价形式）：
 # 设计上"标记通道"= AnthropicStreamWrapper 本身（仅 anthropic 路径构造它），
 # 共享桥零改动。等价闸门：两条流并发交错（Event 强制重叠、覆盖两种终块顺序），

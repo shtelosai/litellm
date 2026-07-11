@@ -208,7 +208,7 @@ async def test_async_iterator_error_after_first_chunk_is_not_pre_first_chunk():
     assert len(chunks) == 1
     assert exc_info.value.status_code == 500
     assert exc_info.value.is_pre_first_chunk is False
-    assert exc_info.value.generated_content == ""
+    assert exc_info.value.generated_content == "hello"
 
 
 def test_maybe_raise_for_response_failed_event_with_dict_error():

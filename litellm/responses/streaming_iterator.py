@@ -113,6 +113,7 @@ class BaseResponsesAPIStreamingIterator:
         self.start_time = getattr(logging_obj, "start_time", datetime.now())
         self._failure_handled = False  # Track if failure handler has been called
         self._yielded_first_chunk = False
+        self._generated_content: str = ""
         self._completed_response_cached = False
         self._completed_response_logged = False
         self._completed_response_cache_hit: Optional[bool] = None
@@ -264,6 +265,10 @@ class BaseResponsesAPIStreamingIterator:
                 # Store the completed response (also for incomplete/failed so logging still fires)
                 _chunk_type = getattr(openai_responses_api_chunk, "type", None)
                 openai_types = _get_openai_response_types()
+                if _chunk_type == openai_types.ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA:
+                    _delta = getattr(openai_responses_api_chunk, "delta", None)
+                    if isinstance(_delta, str):
+                        self._generated_content += _delta
                 if openai_responses_api_chunk and _chunk_type in (
                     openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
                     openai_types.ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE,
@@ -423,7 +428,7 @@ class BaseResponsesAPIStreamingIterator:
             model=self.model or "",
             llm_provider=self.custom_llm_provider or "",
             original_exception=mapped_exception,
-            generated_content="",
+            generated_content=self._generated_content,
             is_pre_first_chunk=not self._yielded_first_chunk,
         )
 

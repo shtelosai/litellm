@@ -117,6 +117,7 @@ from litellm.types.llms.openai import (
     ChatCompletionAssistantToolCall,
     ChatCompletionImageObject,
     ChatCompletionImageUrlObject,
+    ChatCompletionReasoningItem,
     ChatCompletionRedactedThinkingBlock,
     ChatCompletionRequest,
     ChatCompletionSystemMessage,
@@ -513,7 +514,7 @@ class LiteLLMAnthropicMessagesAdapter:
             has_cache_control_in_text = False
             tool_calls: List[ChatCompletionAssistantToolCall] = []
             thinking_blocks: List[Union[ChatCompletionThinkingBlock, ChatCompletionRedactedThinkingBlock]] = []
-            twork_reasoning_items: List[Dict[str, Any]] = []
+            twork_reasoning_items: List[ChatCompletionReasoningItem] = []
             if m["role"] == "assistant":
                 if isinstance(m.get("content"), str):
                     assistant_message_str = str(m.get("content", ""))
@@ -569,7 +570,15 @@ class LiteLLMAnthropicMessagesAdapter:
                                     else None
                                 )
                                 if roundtrip_items:
-                                    twork_reasoning_items.extend(roundtrip_items)
+                                    twork_reasoning_items.extend(
+                                        ChatCompletionReasoningItem(
+                                            type="reasoning",
+                                            id=item.get("id", ""),
+                                            encrypted_content=item.get("encrypted_content"),
+                                            summary=[],
+                                        )
+                                        for item in roundtrip_items
+                                    )
                                     continue
                                 redacted_thinking_block = ChatCompletionRedactedThinkingBlock(
                                     type="redacted_thinking",
@@ -604,7 +613,7 @@ class LiteLLMAnthropicMessagesAdapter:
                 if len(thinking_blocks) > 0:
                     assistant_message["thinking_blocks"] = thinking_blocks  # type: ignore
                 if len(twork_reasoning_items) > 0:
-                    assistant_message["reasoning_items"] = twork_reasoning_items  # type: ignore
+                    assistant_message["reasoning_items"] = twork_reasoning_items
                 new_messages.append(assistant_message)
 
         return new_messages
@@ -1158,9 +1167,7 @@ class LiteLLMAnthropicMessagesAdapter:
         new_content: List[Dict[str, Any]] = []
         for choice in choices:
             reasoning_items = (
-                getattr(choice.message, "reasoning_items", None)
-                if twork_reasoning_roundtrip.is_enabled()
-                else None
+                getattr(choice.message, "reasoning_items", None) if twork_reasoning_roundtrip.is_enabled() else None
             )
             if reasoning_items:
                 packed_data = twork_reasoning_roundtrip.pack_reasoning_items(reasoning_items)

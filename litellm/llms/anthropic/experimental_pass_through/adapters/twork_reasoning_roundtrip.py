@@ -16,6 +16,7 @@ Kill switch: set ``LITELLM_TWORK_REASONING_ROUNDTRIP=0`` (default: enabled).
 """
 
 import base64
+import binascii
 import json
 import os
 from typing import Any, Dict, List, Optional
@@ -63,8 +64,8 @@ def unpack_signature(signature: Any) -> Optional[List[Dict[str, Any]]]:
     if not isinstance(signature, str) or not signature.startswith(SIGNATURE_PREFIX):
         return None
     try:
-        payload = json.loads(base64.b64decode(signature[len(SIGNATURE_PREFIX):]).decode())
-    except Exception:
+        payload = json.loads(base64.b64decode(signature[len(SIGNATURE_PREFIX) :]).decode())
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
         return None
     if not isinstance(payload, list):
         return None

@@ -98,8 +98,7 @@ class AnthropicResponsesStreamWrapper:
                 else getattr(error_payload, "message", None)
             )
             raise ValueError(
-                f"Responses API stream error ({error_code or event_type}): "
-                f"{error_message or 'Unknown upstream error'}"
+                f"Responses API stream error ({error_code or event_type}): {error_message or 'Unknown upstream error'}"
             )
 
         # ---- message_start ----

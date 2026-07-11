@@ -822,11 +822,13 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
         if self.reasoning_roundtrip_emitted or not twork_reasoning_roundtrip.is_enabled():
             return
-        try:
-            delta = raw_chunk.choices[0].delta
-            items = getattr(delta, "reasoning_items", None)
-        except Exception:
+        choices = getattr(raw_chunk, "choices", None)
+        if not choices:
             return
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            return
+        items = getattr(delta, "reasoning_items", None)
         if not items or getattr(delta, "content", None) or getattr(delta, "tool_calls", None):
             return
         packed_data = twork_reasoning_roundtrip.pack_reasoning_items(items)
